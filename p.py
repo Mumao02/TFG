@@ -5,16 +5,20 @@ from scapy.all import sniff, IP, UDP, TCP, PcapReader
 import time
 from collections import deque, defaultdict
 import signal
-import pyshark
+import pcapy
+from struct import unpack
+import multiprocessing
 
-# Variables globales para detener la captura
-stop_sniffing_event= threading.Event()
+# Variable global para detener los hilos
+detener = False
 
 # Variables globales
 cola_paquetes = deque()  # Cola centralizada para paquetes en orden de llegada
 llamadas = defaultdict(lambda: {
     "sip": [],  # Paquetes SIP asociados a la llamada
+    "sip_headers":[],
     "rtp": [],  # Paquetes RTP asociados a la llamada
+    "rtp_headers":[],
     "num_paquetes": 0,
     "inactividad": 0,
     "sdp": {
@@ -42,11 +46,13 @@ llamadas = defaultdict(lambda: {
 
 lock_cola = threading.Lock()  # Bloqueo para acceso seguro a la cola
 lock_llamadas = threading.Lock()  # Bloqueo para acceso seguro a las llamadas
-TIEMPO_INACTIVIDAD = 5  # Tiempo de inactividad en segundos para considerar una llamada inactiva
+TIEMPO_INACTIVIDAD = 60  # Tiempo de inactividad en segundos para considerar una llamada inactiva
+# Rango de puertos RTP (ajusta estos valores según lo necesites)
+PUERTOS_RTP = range(16384, 32768)
 
 
 # Calcular estadísticas RTP: número de paquetes, bytes, jitter y pérdida de paquetes
-def analizar_rtp(paquetes_rtp):
+def analizar_rtp(paquetes_rtp,time):
     num_paquetes = len(paquetes_rtp)
     total_bytes = sum(len(pkt) for pkt in paquetes_rtp)
     jitter_total = 0
@@ -56,10 +62,13 @@ def analizar_rtp(paquetes_rtp):
     jitter_max=0
     jitter_min= math.inf
 
-    for pkt in paquetes_rtp:
-        rtp_payload = pkt[UDP].load
-        num_seq = int.from_bytes(rtp_payload[2:4], byteorder='big')  # Convertir número de secuencia a entero
-        tiempo_marca = pkt.time
+    for indice, pkt in enumerate(paquetes_rtp):
+        rtp_payload = pkt[42:]  # Todo lo que queda después de la cabecera Ethernet (14) + IP (20) + UDP (8)
+        num_seq = (rtp_payload[2] << 8) | rtp_payload[3]  # Combinar los bytes alto y bajo
+        tiempo_inicial_tuple = time[indice].getts()  # (segundos, microsegundos)
+        # Convertir a un único valor en segundos
+        tiempo_inicial = tiempo_inicial_tuple[0] + tiempo_inicial_tuple[1] / 1000000
+        tiempo_marca = tiempo_inicial
         if ultimo_num_seq is not None:
             if num_seq != ultimo_num_seq + 1:
                 perdida_paquetes += (num_seq - ultimo_num_seq - 1)  # Estimar la pérdida de paquetes
@@ -78,38 +87,60 @@ def analizar_rtp(paquetes_rtp):
     if len(paquetes_rtp) == 0:
         duracion = 0
     else:
-        duracion = paquetes_rtp[-1].time - paquetes_rtp[0].time
+        tiempo_inicial_tuple = time[0].getts()  # (segundos, microsegundos)
+        # Convertir a un único valor en segundos
+        tiempo_inicial = tiempo_inicial_tuple[0] + tiempo_inicial_tuple[1] / 1000000
+        tiempo_final_tuple = time[indice].getts()  # (segundos, microsegundos)
+        # Convertir a un único valor en segundos
+        tiempo_final = tiempo_final_tuple[0] + tiempo_final_tuple[1] / 1000000
+        duracion = tiempo_final - tiempo_inicial
     jitter_promedio = jitter_total / num_paquetes if num_paquetes > 0 else 0
     return num_paquetes, total_bytes, perdida_paquetes, jitter_promedio, jitter_max, jitter_min, duracion
 
 # Filtrar paquetes RTP correspondientes a un flujo basado en IP y puerto
-def filtrar_paquetes_rtp(paquetes, ip_rtp, puerto_rtp):
+def filtrar_paquetes_rtp(paquetes, ip_rtp, puerto_rtp,headers):
     paquetes_rtp = []
-    for pkt in paquetes:
-        if UDP in pkt and pkt[UDP].sport == puerto_rtp and pkt[IP].src == ip_rtp:
-            paquetes_rtp.append(pkt)
-    return paquetes_rtp
+    headers_rtp = []
+    for indice, pkt in enumerate(paquetes):
+        ip_header = pkt[14:34]  # Cabecera IP
+        udp_header = pkt[34:42]  # Cabecera UDP
+        ip_src = unpack('!4B', ip_header[12:16])  # IP origen
+        ip_dst = unpack('!4B', ip_header[16:20])  # IP destino
+        ip_origen = '.'.join(map(str, ip_src))
+        ip_destino = '.'.join(map(str, ip_dst))
 
-def calcular_duracion_facturable(paquetes_sip):
+        udp_hdr = unpack('!HHHH', udp_header)  # Desempaquetar la cabecera UDP
+        puerto_origen = udp_hdr[0]  # Puerto origen
+        puerto_destino = udp_hdr[1]  # Puerto destino
+        if puerto_origen == puerto_rtp and ip_origen == ip_rtp:
+            paquetes_rtp.append(pkt)
+            headers_rtp.append(headers[indice])
+    return paquetes_rtp, headers_rtp
+
+def calcular_duracion_facturable(paquetes_sip,time):
     tiempo_ok = None
     tiempo_bye = None
     duracion_facturable = None
 
-    for pkt in paquetes_sip:
+    for indice, pkt in enumerate(paquetes_sip):
         # Obtener el contenido del paquete
-        if UDP in pkt:
-            payload = pkt[UDP].load.decode("utf-8", errors="ignore")
-        elif TCP in pkt:
-            payload = pkt[TCP].payload.load.decode("utf-8", errors="ignore")
+        payload = pkt[42:]  # Todo lo que queda después de la cabecera Ethernet (14) + IP (20) + UDP (8)
+        payload = payload.decode("utf-8", errors="ignore")
 
         # Buscar el 200 OK
         if "200 OK" in payload:
-            tiempo_ok = pkt.time
+            tiempo_inicial_tuple = time[indice].getts()  # (segundos, microsegundos)
+            # Convertir a un único valor en segundos
+            tiempo_inicial = tiempo_inicial_tuple[0] + tiempo_inicial_tuple[1] / 1000000
+            tiempo_ok = tiempo_inicial
 
         es_req, metodo_sip, uri_sip = es_request(payload)
         # Buscar el BYE
         if es_req and "BYE" in metodo_sip:
-            tiempo_bye = pkt.time
+            tiempo_inicial_tuple = time[indice].getts()  # (segundos, microsegundos)
+            # Convertir a un único valor en segundos
+            tiempo_inicial = tiempo_inicial_tuple[0] + tiempo_inicial_tuple[1] / 1000000
+            tiempo_bye = tiempo_inicial
 
         # Si ambos tiempos se han capturado, calcular la duración
         if tiempo_ok and tiempo_bye:
@@ -122,31 +153,37 @@ def calcular_duracion_facturable(paquetes_sip):
     else:
         return None  # Si no se encontraron los mensajes 200 OK o BYE
 
-def calcular_pdd(paquetes_sip):
+def calcular_pdd(paquetes_sip, time):
     pdd = None
     tiempo_invite = None
     tiempo_trying = None
     tiempo_ringing = None
 
-    for pkt in paquetes_sip:
+    for indice, pkt in enumerate(paquetes_sip):
         # Obtener el tiempo de la llamada INVITE
-        if UDP in pkt:
-            payload = pkt[UDP].load.decode("utf-8", errors="ignore")
-        elif TCP in pkt:
-            payload = pkt[TCP].payload.load.decode("utf-8", errors="ignore")
-
+        payload = pkt[42:]  # Todo lo que queda después de la cabecera Ethernet (14) + IP (20) + UDP (8)
+        payload = payload.decode("utf-8", errors="ignore")
         es_req, metodo_sip, uri_sip = es_request(payload)
         # Buscar el BYE
         if es_req and "INVITE" in metodo_sip:
-            tiempo_invite = pkt.time
+            tiempo_inicial_tuple = time[indice].getts()  # (segundos, microsegundos)
+            # Convertir a un único valor en segundos
+            tiempo_inicial = tiempo_inicial_tuple[0] + tiempo_inicial_tuple[1] / 1000000
+            tiempo_invite = tiempo_inicial
         
         # Comprobar si el paquete es una respuesta 100 TRYING
         if "SIP/2.0 100 Trying" in payload:
-            tiempo_trying = pkt.time
+            tiempo_inicial_tuple = time[indice].getts()  # (segundos, microsegundos)
+            # Convertir a un único valor en segundos
+            tiempo_inicial = tiempo_inicial_tuple[0] + tiempo_inicial_tuple[1] / 1000000
+            tiempo_trying = tiempo_inicial
         
         # Comprobar si el paquete es una respuesta 180 RINGING
         if "SIP/2.0 180 Ringing" in payload:
-            tiempo_ringing = pkt.time
+            tiempo_inicial_tuple = time[indice].getts()  # (segundos, microsegundos)
+            # Convertir a un único valor en segundos
+            tiempo_inicial = tiempo_inicial_tuple[0] + tiempo_inicial_tuple[1] / 1000000
+            tiempo_ringing = tiempo_inicial
 
         # Calcular PDD usando el primer tiempo de respuesta válido
         if tiempo_invite is not None:
@@ -166,21 +203,19 @@ def extraer_user_agent(paquetes_sip):
     uri_sip = None
     p_charging_vector = None
     for pkt in paquetes_sip:
-        if UDP in pkt:
-            payload = pkt[UDP].load.decode("utf-8", errors="ignore")
-        elif TCP in pkt:
-            payload = pkt[TCP].payload.load.decode("utf-8", errors="ignore")
+        payload = pkt[42:]  # Todo lo que queda después de la cabecera Ethernet (14) + IP (20) + UDP (8)
+        payload = payload.decode("utf-8", errors="ignore")
         es_req, metodo_sip, uri_sip = es_request(payload)
         if es_req and str(metodo_sip) == 'INVITE':
-            if "User-Agent" in pkt[UDP].load.decode('utf-8', errors='ignore'):
+            if "User-Agent" in payload:
                 # Extrae el User-Agent
-                llamante = pkt[UDP].load.decode('utf-8', errors='ignore').split("User-Agent: ")[1].split("\r\n")[0]
+                llamante = payload.split("User-Agent: ")[1].split("\r\n")[0]
             uri_sip = uri_sip
         es_res, codigo_sip, estado = es_response(payload)
         if es_res and codigo_sip == "200" and estado == "OK":
-            if "User-Agent" in pkt[UDP].load.decode('utf-8', errors='ignore'):
+            if "User-Agent" in payload:
                 # Extrae el User-Agent
-                llamado = pkt[UDP].load.decode('utf-8', errors='ignore').split("User-Agent: ")[1].split("\r\n")[0]
+                llamado = payload.split("User-Agent: ")[1].split("\r\n")[0]
                 if "To:" in payload:
                     mensaje_to = payload.split("To: ")[1].split("\r\n")[0]
                     if ";" in mensaje_to:
@@ -286,107 +321,199 @@ def extraer_info_sdp(sdp_text):
 
     return ip, port, codecs
 
+def es_paquete_sip(paquete):
+    """
+    Verifica si un paquete es SIP. Asumimos que SIP usa el puerto 5060.
+    """
+    try:
+        # La IP comienza en el byte 14 (después de la cabecera Ethernet)
+        ip_header = paquete[14:34]
+        ip_hdr = unpack('!BBHHHBBH4s4s', ip_header)
+
+        # Extraer puertos UDP (comienzan después de la cabecera IP)
+        udp_header = paquete[34:42]  # Los primeros 8 bytes después de la cabecera IP
+        udp_hdr = unpack('!HHHH', udp_header)
+
+        sport = udp_hdr[0]
+        dport = udp_hdr[1]
+        if sport == 5060 or dport == 5060:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def es_paquete_rtp(paquete):
+    """
+    Verifica si un paquete es RTP. Usamos el rango de puertos UDP.
+    """
+    try:
+        # La IP comienza en el byte 14 (después de la cabecera Ethernet)
+        ip_header = paquete[14:34]
+        ip_hdr = unpack('!BBHHHBBH4s4s', ip_header)
+
+        # Extraer puertos UDP (comienzan después de la cabecera IP)
+        udp_header = paquete[34:42]  # Los primeros 8 bytes después de la cabecera IP
+        udp_hdr = unpack('!HHHH', udp_header)
+        sport, dport = udp_hdr[0], udp_hdr[1]
+
+        # Comprobar si el paquete está en el rango de puertos RTP
+        if sport in PUERTOS_RTP or dport in PUERTOS_RTP:
+            return True
+    except Exception:
+        return False
+    return False
 
 # Función para procesar paquetes
 def procesar_paquetes():
     """
     Procesa los paquetes en la cola en orden de llegada y agrupa llamadas inactivas.
     """
-    global cola_paquetes, llamadas
+    global cola_paquetes,detener
 
-    while True:
+    while detener != True:
         time.sleep(1)  # Ajusta el intervalo según sea necesario
         # Procesar paquetes en la cola
         with lock_cola:
             while cola_paquetes:
-                paquete = cola_paquetes.popleft()  # Extraer paquete de la cola
-                if paquete.haslayer(UDP):  # Verificar que el paquete tenga capa UDP
-                    if paquete[UDP].sport == 5060 or paquete[UDP].dport == 5060:  # SIP
-                        procesar_sip(paquete)
-                    else:  # RTP
-                        procesar_rtp(paquete)
+                header, paquete = cola_paquetes.popleft()  # Extraer paquete de la cola
+                # Asegúrate de que el paquete sea de longitud suficiente
+                if es_paquete_sip(paquete):
+                    #print("Paquete SIP detectado.")
+                    procesar_sip(header,paquete)
+                    # Aquí puedes agregar código para procesar SIP (si es necesario)
+                elif es_paquete_rtp(paquete):
+                    #print("Paquete RTP detectado.")
+                    procesar_rtp(header,paquete)
+                    # Aquí puedes agregar código para procesar RTP (si es necesario)
 
-        # Agrupar llamadas inactivas
 
-
-def procesar_sip(paquete):
+def procesar_sip(header,paquete):
     """
     Procesa paquetes SIP y extrae información SDP.
     """
     global llamadas
-    if paquete.haslayer("Raw"):
-        payload = paquete[UDP].load.decode("utf-8", errors="ignore")
-        call_id = extraer_call_id(payload)
 
-        if call_id:
-            with lock_llamadas:
-                # Actualizar información de la llamada
-                llamadas[call_id]["sip"].append(paquete)
-                sip_origen = paquete[IP].src
-                sip_destino = paquete[IP].dst
+    try:
+        # Extraemos la cabecera Ethernet (14 bytes)
+        ethernet_header = paquete[0:14]  # La cabecera Ethernet es siempre de 14 bytes
 
-                # Identificar mensajes BYE y 200 OK
-                es_req, metodo_sip, _ = es_request(payload)
-                es_res, codigo_sip, _ = es_response(payload)
-                
-                if es_req and metodo_sip == "BYE":
-                    llamadas[call_id]["bye_time"] = paquete.time
-                    llamadas[call_id]["bye_detected"] = True
+        # Extraemos la cabecera IP (20 bytes estándar sin opciones)
+        ip_header = paquete[14:34]  # Después de la cabecera Ethernet, comienza la IP (14 bytes + 20 bytes)
+        
+        # Extraemos la cabecera UDP (8 bytes)
+        udp_header = paquete[34:42]  # Después de la cabecera IP (14 + 20 bytes = 34), comienza la UDP (8 bytes)
+        udp_hdr = unpack('!HHHH', udp_header)  # Desempaquetamos cabecera UDP
+        sport, dport = udp_hdr[0], udp_hdr[1]
 
-                if es_res and codigo_sip == "200":
-                    llamadas[call_id]["ok_time"] = paquete.time
-                    if "bye_detected" in llamadas[call_id] and llamadas[call_id]["bye_detected"]:
-                        llamadas[call_id]["bye_responded"] = True
+        # Verificar si es un paquete SIP (usualmente usa el puerto 5060)
+        if sport == 5060 or dport == 5060:
+            # Extraemos la carga útil (todo después de la cabecera UDP)
+            carga_util = paquete[42:]  # Todo lo que queda después de la cabecera Ethernet (14) + IP (20) + UDP (8)
 
-                # Actualizar última actividad SIP
-                llamadas[call_id]["ultima_actividad_sip"] = paquete.time
+            try:
+                # Decodificamos la carga útil en formato UTF-8
+                payload = carga_util.decode("utf-8", errors="ignore")
+                timestamp_paquete = header.getts()  # Esto te da el tiempo de captura del paquete
+                # Extraer el Call-ID de la carga útil (ejemplo de función para extraerlo)
+                call_id = extraer_call_id(payload)
+                if call_id:
+                    with lock_llamadas:
+                        # Verificar si el call_id ya existe
+                        if call_id not in llamadas:
+                            llamadas[call_id] = {"sip": [],"sip_headers":[], "rtp": [],"rtp_headers":[], "sdp": {}, "ultima_actividad_sip": None, "ultima_actividad_rtp": None}
 
-                # Extraer información SDP si está presente
-                if "Content-Type: application/sdp" in payload:
-                    sdp_ip, sdp_port, sdp_codecs = extraer_info_sdp(payload)
-                    es_req, metodo_sip, uri_sip = es_request(payload)
-                    if sdp_ip and sdp_port:
-                        if es_req and metodo_sip == "INVITE":
-                            llamadas[call_id]["sdp"]['llamante'] = {
-                                    "ip": sdp_ip,
-                                    "port": int(sdp_port),
-                                    "codecs": sdp_codecs,
-                                }
-                        else:
-                            llamadas[call_id]["sdp"]['llamado'] = {
-                                    "ip": sdp_ip,
-                                    "port": int(sdp_port),
-                                    "codecs": sdp_codecs,
-                                }
+                        # Actualizar la información de la llamada
+                        llamadas[call_id]["sip"].append(paquete)
+                        llamadas[call_id]["sip_headers"].append(header)
+                        if "num_paquetes" not in llamadas[call_id]:
+                            llamadas[call_id]["num_paquetes"] = 0
+                        llamadas[call_id]["num_paquetes"] += 1
+
+                        # Identificar mensajes BYE y 200 OK
+                        es_req, metodo_sip, _ = es_request(payload)
+                        es_res, codigo_sip, _ = es_response(payload)
+
+                        if es_req and metodo_sip == "BYE":
+                            llamadas[call_id]["bye_time"] = timestamp_paquete
+                            llamadas[call_id]["bye_detected"] = True
+
+                        if es_res and codigo_sip == "200":
+                            llamadas[call_id]["ok_time"] = timestamp_paquete
+                            if "bye_detected" in llamadas[call_id] and llamadas[call_id]["bye_detected"]:
+                                llamadas[call_id]["bye_responded"] = True
+
+                        # Actualizar última actividad SIP
+                        llamadas[call_id]["ultima_actividad_sip"] = timestamp_paquete
+
+                        # Extraer información SDP si está presente
+                        if "Content-Type: application/sdp" in payload:
+                            sdp_ip, sdp_port, sdp_codecs = extraer_info_sdp(payload)
+                            es_req, metodo_sip, uri_sip = es_request(payload)
+                            if sdp_ip and sdp_port:
+                                if es_req and metodo_sip == "INVITE":
+                                    llamadas[call_id]["sdp"]['llamante'] = {
+                                        "ip": sdp_ip,
+                                        "port": int(sdp_port),
+                                        "codecs": sdp_codecs,
+                                    }
+                                else:
+                                    llamadas[call_id]["sdp"]['llamado'] = {
+                                        "ip": sdp_ip,
+                                        "port": int(sdp_port),
+                                        "codecs": sdp_codecs,
+                                    }
+            except Exception as e:
+                print(f"Error al procesar carga útil SIP: {e}")
+    except Exception as e:
+        print(f"Error al procesar paquete SIP: {e}")
 
 
 paquetes_rtp_no_asociados = []
 
-def procesar_rtp(paquete):
+def procesar_rtp(header,paquete):
     global llamadas, paquetes_rtp_no_asociados
-    ip_origen = paquete[IP].src
-    puerto_origen = paquete[UDP].sport
+
+    # Desempaquetar la cabecera IP (20 bytes) y UDP (8 bytes) para obtener la IP y los puertos
+    ip_header = paquete[14:34]  # Cabecera IP
+    udp_header = paquete[34:42]  # Cabecera UDP
+    ip_src = unpack('!4B', ip_header[12:16])  # IP origen
+    ip_dst = unpack('!4B', ip_header[16:20])  # IP destino
+    ip_origen = '.'.join(map(str, ip_src))
+    ip_destino = '.'.join(map(str, ip_dst))
+
+    udp_hdr = unpack('!HHHH', udp_header)  # Desempaquetar la cabecera UDP
+    puerto_origen = udp_hdr[0]  # Puerto origen
+    puerto_destino = udp_hdr[1]  # Puerto destino
 
     asociado = False
-
+    timestamp_paquete = header.getts()  # Esto te da el tiempo de captura del paquete
+    # Procesar las llamadas y asociar el paquete RTP
     with lock_llamadas:
         for call_id, data in llamadas.items():
             if "sdp" in data and data["sdp"]:
-                sdp_info1 = data["sdp"]['llamante']
-                sdp_info2 = data["sdp"]['llamado']
-                if sdp_info1["ip"] == ip_origen and sdp_info1["port"] == puerto_origen:
+                sdp_info1 = data["sdp"].get('llamante', {})
+                sdp_info2 = data["sdp"].get('llamado', {})
+                if sdp_info1 and sdp_info1["ip"] == ip_origen and sdp_info1["port"] == puerto_origen:
                     # RTP entrante
                     llamadas[call_id]["rtp"].append(paquete)
-                    # Actualizar última actividad SIP
-                    llamadas[call_id]["ultima_actividad_rtp"] = paquete.time
+                    llamadas[call_id]["rtp_headers"].append(header)
+                    # Actualizar última actividad RTP
+                    llamadas[call_id]["ultima_actividad_rtp"] = timestamp_paquete
+                    if "num_paquetes" not in llamadas[call_id]:
+                        llamadas[call_id]["num_paquetes"] = 0
+                    llamadas[call_id]["num_paquetes"] += 1
                     asociado = True
                     break
-                elif sdp_info2["ip"] == ip_origen and sdp_info2["port"] == puerto_origen:
+                elif sdp_info2 and sdp_info2["ip"] == ip_origen and sdp_info2["port"] == puerto_origen:
                     # RTP saliente
                     llamadas[call_id]["rtp"].append(paquete)
-                    
-                    # Actualizar última actividad SIP
-                    llamadas[call_id]["ultima_actividad_rtp"] = paquete.time
+                    llamadas[call_id]["rtp_headers"].append(header)
+                    # Actualizar última actividad RTP
+                    llamadas[call_id]["ultima_actividad_rtp"] = timestamp_paquete
+                    if "num_paquetes" not in llamadas[call_id]:
+                        llamadas[call_id]["num_paquetes"] = 0
+                    llamadas[call_id]["num_paquetes"] += 1
                     asociado = True
                     break
 
@@ -399,13 +526,14 @@ def monitorear_inactividad(filtros,interfaz):
     2. BYE sin respuesta.
     3. Inactividad general.
     """
-    global llamadas
+    global llamadas,detener
 
-    while True:
+    while detener != True:
         time.sleep(1)  # Intervalo para revisar
         with lock_llamadas:
             for call_id, data in list(llamadas.items()):
-
+                if "inactividad" not in llamadas[call_id]:
+                        llamadas[call_id]["inactividad"] = 0
                 if llamadas[call_id]["num_paquetes"] == len(llamadas[call_id]["sip"]) + len(llamadas[call_id]["rtp"]):
                     llamadas[call_id]["inactividad"] += 1
                 else:
@@ -416,9 +544,13 @@ def monitorear_inactividad(filtros,interfaz):
                 if  llamadas[call_id]["inactividad"] >= TIEMPO_INACTIVIDAD:
                     imprimir_llamada(call_id, "Inactividad general",filtros,interfaz)
                     #del llamadas[call_id]
-                
+                if "bye_detected" not in llamadas[call_id]:
+                        llamadas[call_id]["bye_detected"] = False
+                if "bye_responded" not in llamadas[call_id]:
+                        llamadas[call_id]["bye_responded"] = False
                 if llamadas[call_id]["bye_detected"] == True and llamadas[call_id]["bye_responded"] == True:
                     imprimir_llamada(call_id, "BYE",filtros,interfaz)
+            
 
 def imprimir_llamada(call_id, motivo, filtros, interfaz):
     global llamadas
@@ -433,32 +565,54 @@ def imprimir_llamada(call_id, motivo, filtros, interfaz):
     sip_inicial = data['sip'][0]
     sip_final = data['sip'][-1]
     protocolo_transporte = ""
-    if UDP in sip_inicial:
-        payload = sip_inicial[UDP].load.decode("utf-8", errors="ignore")
-        ip_origen = sip_inicial[IP].src
-        ip_destino = sip_inicial[IP].dst
-        puerto_origen = sip_inicial[UDP].sport
-        puerto_destino = sip_inicial[UDP].dport
-        protocolo_transporte = "UDP"
-    elif TCP in sip_inicial:
-        payload = sip_inicial[TCP].payload.load.decode("utf-8", errors="ignore")
-        ip_origen = sip_inicial[IP].src
-        ip_destino = sip_inicial[IP].dst
-        puerto_origen = sip_inicial[TCP].sport
-        puerto_destino = sip_inicial[TCP].dport
+
+    ip_header = sip_inicial[14:34]
+    ip_hdr = unpack('!BBHHHBBH4s4s', ip_header)  # Desempaquetar la cabecera IP
+    ip_version_ihl = ip_hdr[0]
+    ip_length = (ip_version_ihl & 0x0F) * 4  # Longitud de la cabecera IP en bytes
+
+    if len(sip_inicial) < 14 + ip_length:  # Validar longitud total del paquete
+        return {"error": "Paquete incompleto para analizar IP"}
+
+    # Extraer campos de la cabecera IP
+    protocolo = ip_hdr[6]  # Campo de protocolo
+    ip_origen = ".".join(map(str, ip_hdr[8]))  # Dirección IP origen
+    ip_destino = ".".join(map(str, ip_hdr[9]))  # Dirección IP destino
+
+    # Determinar el inicio de la cabecera de transporte (UDP/TCP)
+    transport_header_start = 14 + ip_length
+
+    # Verificar longitud suficiente para la cabecera de transporte (8 bytes mínimo)
+    if len(sip_inicial) < transport_header_start + 8:
+        return {"error": "Paquete demasiado corto para analizar cabecera de transporte"}
+
+    # Extraer cabecera UDP o TCP y los puertos
+    transport_header = sip_inicial[transport_header_start:transport_header_start + 8]
+    puerto_origen, puerto_destino = unpack('!HH', transport_header[:4])
+    if protocolo == 6:  # TCP
         protocolo_transporte = "TCP"
-    payload_inicial = sip_inicial[UDP].load.decode("utf-8", errors="ignore")
+    elif protocolo == 17:  # UDP
+        protocolo_transporte = "UDP"
+    else:
+        protocolo_transporte = "Desconocido"
+    payload_inicial = sip_inicial[42:]  # Todo lo que queda después de la cabecera Ethernet (14) + IP (20) + UDP (8)
+    payload_inicial = payload_inicial.decode("utf-8", errors="ignore")
     # Extraer información adicional SIP y SDP del primer paquete INVITE
     info_sip_inicial = extraer_campos_sip(payload_inicial, filtros)
-    tiempo_inicial = pkt_inicial.time
-    tiempo_final = pkt_final.time
+    tiempo_inicial_tuple = data['rtp_headers'][0].getts()  # (segundos, microsegundos)
+    tiempo_final_tuple = data['rtp_headers'][-1].getts()  # (segundos, microsegundos)
+
+    # Convertir a un único valor en segundos
+    tiempo_inicial = tiempo_inicial_tuple[0] + tiempo_inicial_tuple[1] / 1000000
+    tiempo_final = tiempo_final_tuple[0] + tiempo_final_tuple[1] / 1000000
     duracion_llamada = tiempo_final - tiempo_inicial
     # Extraer información del último paquete
-    payload_final = sip_final[UDP].load.decode("utf-8", errors="ignore") if UDP in sip_final else sip_final[TCP].payload.load.decode("utf-8", errors="ignore")
+    payload_final = sip_final[42:]  # Todo lo que queda después de la cabecera Ethernet (14) + IP (20) + UDP (8)
+    payload_final = payload_final.decode("utf-8", errors="ignore")
     info_sip_final = extraer_campos_sip(payload_final, filtros)
     user_a_llamante, user_a_llamado, mensaje_to, p_asserted, uri_sip, p_charging_vector = extraer_user_agent(data['sip'])
-    pdd = calcular_pdd(data['sip'])
-    duracion_facturable = calcular_duracion_facturable(data['sip'])
+    pdd = calcular_pdd(data['sip'],data['sip_headers'])
+    duracion_facturable = calcular_duracion_facturable(data['sip'],data['sip_headers'])
 
 
     ip_rtp_llamante = data['sdp']['llamante']['ip']
@@ -468,12 +622,12 @@ def imprimir_llamada(call_id, motivo, filtros, interfaz):
     puerto_rtp_llamado = data['sdp']['llamado']['port']
     rtp_codecs_llamado = data['sdp']['llamado']['codecs']
     # Filtrar paquetes RTP de acuerdo a IP y puerto
-    paquetes_rtp_llamante = filtrar_paquetes_rtp(data['rtp'], ip_rtp_llamante, puerto_rtp_llamante)
-    paquetes_rtp_llamado = filtrar_paquetes_rtp(data['rtp'], ip_rtp_llamado, puerto_rtp_llamado)
+    paquetes_rtp_llamante, header_llamante = filtrar_paquetes_rtp(data['rtp'], ip_rtp_llamante, puerto_rtp_llamante,data['rtp_headers'])
+    paquetes_rtp_llamado, header_llamado = filtrar_paquetes_rtp(data['rtp'], ip_rtp_llamado, puerto_rtp_llamado,data['rtp_headers'])
 
     # Análisis RTP para ambas direcciones
-    num_paquetes_llamante, bytes_llamante, perdida_llamante, jitter_llamante,jitter_max_llamante,jitter_min_llamante,duracion_llamante = analizar_rtp(paquetes_rtp_llamante)
-    num_paquetes_llamado, bytes_llamado, perdida_llamado, jitter_llamado,jitter_max_llamado,jitter_min_llamado,duracion_llamado = analizar_rtp(paquetes_rtp_llamado)
+    num_paquetes_llamante, bytes_llamante, perdida_llamante, jitter_llamante,jitter_max_llamante,jitter_min_llamante,duracion_llamante = analizar_rtp(paquetes_rtp_llamante,header_llamante)
+    num_paquetes_llamado, bytes_llamado, perdida_llamado, jitter_llamado,jitter_max_llamado,jitter_min_llamado,duracion_llamado = analizar_rtp(paquetes_rtp_llamado,header_llamado)
     '''
     if data["bye_detected"] == True and data["bye_responded"] == True:
         motivo = "BYE"
@@ -533,10 +687,7 @@ def imprimir_llamada(call_id, motivo, filtros, interfaz):
     print("-" * 50)
     del llamadas[call_id]
 
-
-
-
-def capturar_paquetes(interfaz):
+def capturar_paquetes(interfaz,tiempo_maximo):
     """
     Captura paquetes SIP y RTP desde una interfaz y mide el rendimiento en tiempo real.
 
@@ -544,23 +695,27 @@ def capturar_paquetes(interfaz):
     """
     print(f"Iniciando captura de tráfico en la interfaz {interfaz}...")
 
+    global detener
+    start_time = time.time()
     total_paquetes = 0
     total_bytes = 0
-    start_time = time.time()
-
-    def manejar_paquete(paquete):
+    def manejar_paquete(header, data):
         nonlocal total_paquetes, total_bytes
         with lock_cola:
-            cola_paquetes.append(paquete)  # Añade cada paquete a la cola
+            cola_paquetes.append((header, data))  # Añade el paquete a la cola
         total_paquetes += 1
-        total_bytes += len(paquete)
-
+        total_bytes += header.getlen()
     try:
-        while not stop_sniffing_event.is_set():
-            sniff(iface=interfaz, prn=manejar_paquete, store=False, timeout=1)
-    except Exception as e:
-        print(f"Ocurrió un error al capturar tráfico en la interfaz {interfaz}: {e}")
-    finally:
+        cap = pcapy.open_live(interfaz, 0, 1, 0)  # Buffer infinito, modo promiscuo, timeout 1s
+        while time.time() - start_time < tiempo_maximo and detener != True:
+            # Leer el siguiente paquete
+            try:
+                header, packet = cap.next()
+                if header is not None:
+                    manejar_paquete(header, packet)
+            except pcapy.PcapError:
+                # Si no se captura nada en este intervalo, continuar
+                continue
         elapsed_time = time.time() - start_time
 
         if elapsed_time > 0:
@@ -572,6 +727,8 @@ def capturar_paquetes(interfaz):
             print(f" - Tasa de bits: {tasa_bits:.2f} bits/s")
 
         print(f"Finalizada la captura de tráfico en la interfaz {interfaz}.")
+    except Exception as e:
+        print(f"Ocurrió un error al capturar tráfico en la interfaz {interfaz}: {e}")
 
 
 
@@ -582,61 +739,60 @@ def leer_paquetes_de_pcap(archivo_pcap):
     :param archivo_pcap: Ruta al archivo PCAP que contiene los paquetes a procesar.
     """
     print(f"Iniciando lectura de tráfico desde el archivo {archivo_pcap}...")
-
-    total_paquetes = 0
+    global detener
     total_bytes = 0
     start_time = time.time()
+    paquetes_procesados = 0
 
     try:
-        # Usamos pyshark para procesar el archivo PCAP
-        captura = pyshark.FileCapture(archivo_pcap)
+        # Abrir el archivo PCAP en modo offline
+        capturador = pcapy.open_offline(archivo_pcap)
+        print("Archivo cargado exitosamente.")
 
-        for paquete in captura:
+        while detener != True:
+            # Leer el siguiente paquete
+            header, paquete = capturador.next()
+            if not header:
+                break  # No hay más paquetes
+
             with lock_cola:
-                cola_paquetes.append(paquete)  # Añade cada paquete a la cola
+                cola_paquetes.append((header, paquete))  # Añadir paquete a la cola
+                paquetes_procesados += 1  # Incrementar contador global
 
-            total_paquetes += 1
-
-            # Calculamos el tamaño del paquete (si tiene capa raw, usamos eso)
-            if hasattr(paquete, 'length'):
-                total_bytes += int(paquete.length)
-            elif hasattr(paquete, 'frame_info'):
-                total_bytes += int(paquete.frame_info.len)
-            else:
-                total_bytes += len(str(paquete))
+            total_bytes += header.getlen()
 
         elapsed_time = time.time() - start_time
 
+        # Calcular tasas de rendimiento
         if elapsed_time > 0:
-            tasa_paquetes = total_paquetes / elapsed_time
+            tasa_paquetes = paquetes_procesados / elapsed_time
             tasa_bits = (total_bytes * 8) / elapsed_time
 
-            print(f"Rendimiento:")
+            print("\nRendimiento:")
             print(f" - Tasa de paquetes: {tasa_paquetes:.2f} paquetes/s")
             print(f" - Tasa de bits: {tasa_bits:.2f} bits/s")
 
-        print(f"Finalizada la lectura de paquetes desde {archivo_pcap}.")
+        print(f"Lectura finalizada. Total de paquetes procesados: {paquetes_procesados}")
     except FileNotFoundError:
         print(f"El archivo {archivo_pcap} no existe.")
+    except pcapy.PcapError as e:
+        print(f"Error al procesar el archivo {archivo_pcap}: {e}")
     except Exception as e:
-        print(f"Ocurrió un error al procesar el archivo {archivo_pcap}: {e}")
+        print(f"Ocurrió un error inesperado: {e}")
 
-def signal_handler(sig, frame):
-    """Manejador de señal para Ctrl+C."""
-    print("\nDetección de Ctrl+C. Deteniendo captura...")
-    stop_sniffing_event.set()
-
-    # Deshabilitar el manejador de señales para evitar que se siga imprimiendo después
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 # Configuración de hilos
 def iniciar_capturas(tipo, interfaz, filtros):
     """
     Inicia hilos para capturar tráfico, procesar paquetes y mostrar las llamadas periódicamente.
     """
+    global detener
     try:
         if str(tipo) == '0':
-            hilo_captura = threading.Thread(target=capturar_paquetes, args=(interfaz,))
+            tiempo_maximo = 0
+            while tiempo_maximo < 1:
+                tiempo_maximo = int(input("Introduce el tiempo máximo para la captura (en segundos y > 1 segundo): "))
+            hilo_captura = threading.Thread(target=capturar_paquetes, args=(interfaz,tiempo_maximo,))
         else:
             print("Archivo")
             hilo_captura = threading.Thread(target=leer_paquetes_de_pcap, args=(interfaz,))
@@ -649,15 +805,14 @@ def iniciar_capturas(tipo, interfaz, filtros):
         hilo_procesamiento.start()
         hilo_imprimir.start()
 
-        # Monitorear los hilos y procesar señales
         while hilo_captura.is_alive() or hilo_procesamiento.is_alive() or hilo_imprimir.is_alive():
-            time.sleep(0.1)  # Evitar consumo excesivo de CPU
-
+            time.sleep(0.1)  # Reduce el consumo de CPU
+    except KeyboardInterrupt:
+        print("\nControl+C detectado. Deteniendo todos los hilos...")
+        detener = True  # Indicar a los hilos que deben detenerse
     except Exception as e:
         print(f"Error al iniciar las capturas: {e}")
-
     finally:
-        stop_sniffing_event.set()
         # Esperar que todos los hilos terminen
         hilo_captura.join()
         hilo_procesamiento.join()
@@ -673,9 +828,6 @@ if __name__ == "__main__":
         print("Uso: python capturar_trafico.py tipo(0 si interfaz y 1 si pcap) <interfaz o pcap> filtros...")
         sys.exit(1)
 
-
-    # Registrar el manejador de señales para Ctrl+C
-    signal.signal(signal.SIGINT, signal_handler)
 
     tipo = sys.argv[1]
     interfaz = sys.argv[2]
