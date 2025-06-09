@@ -1,0 +1,7 @@
+setup.py
+setup_2.py
+xdp_socket.c
+xdp.egg-info/PKG-INFO
+xdp.egg-info/SOURCES.txt
+xdp.egg-info/dependency_links.txt
+xdp.egg-info/top_level.txt
